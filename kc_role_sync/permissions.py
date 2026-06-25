@@ -35,7 +35,13 @@ def apply_permissions(role: str, permissions: list) -> dict:
         frappe.throw("role is required.")
 
     if not frappe.db.exists("Role", role):
-        frappe.throw(f"Role '{role}' does not exist in this Frappe instance.")
+        frappe.get_doc({
+            "doctype": "Role",
+            "role_name": role,
+            "desk_access": 1,
+        }).insert(ignore_permissions=True)
+        frappe.db.commit()
+        frappe.logger().info(f"KC_PERM_APPLY: created missing Role '{role}' (auto-created on permission push)")
 
     applied = []
     skipped = []
