@@ -28,33 +28,40 @@ NO_PROXY = {"http": "", "https": ""}
 
 
 def on_logout():
-	try:
-		# Identity is still available here — Frappe runs the on_logout trigger BEFORE it
-		# deletes the session (see frappe/auth.py LoginManager.logout).
-		user = frappe.session.user if frappe.session.user != "Guest" else None
+	# Identity is still available here — Frappe runs the on_logout trigger BEFORE it
+	# deletes the session (see frappe/auth.py LoginManager.logout).
+	user = frappe.session.user if frappe.session.user != "Guest" else None
 
-		# Terminate EVERY Keycloak SSO session for this user via the admin API. A plain
-		# RP-initiated logout to the end_session endpoint only ends the one session tied to
-		# its id_token (which we don't have here) — and a portal login spawns several
-		# sessions, so the SSO session would survive and the back-channel fan-out would never
-		# fire. Killing all of the user's sessions makes Keycloak back-channel-logout every
-		# registered client (the central portal and all other apps) in one shot.
+	# 1) Decide the post-logout landing target FIRST and set it immediately. This must happen
+	#    before the (network-bound, failure-prone) Keycloak session termination below, so the
+	#    browser ALWAYS lands on the central portal's no-access page even if termination raises
+	#    or times out. Previously termination ran first inside the same try, so any error there
+	#    skipped this line entirely and Frappe fell back to /login (→ Keycloak re-login screen).
+	try:
+		portal_url = (frappe.conf.get("kc_central_portal_url") or "").rstrip("/")
+		if portal_url:
+			frappe.local.response["redirect_to"] = f"{portal_url}/kalyan/applications?no_access=1"
+		else:
+			frappe.logger().warning(
+				"KC_LOGOUT: kc_central_portal_url not set in site_config — falling back to local "
+				"/login (browser will re-authenticate instead of landing on the portal no-access page)"
+			)
+			frappe.local.response["redirect_to"] = frappe.utils.get_url("/login")
+	except Exception as exc:
+		frappe.logger().error(f"KC_LOGOUT: could not set post-logout redirect: {exc}")
+
+	# 2) Terminate EVERY Keycloak SSO session for this user via the admin API. A plain
+	#    RP-initiated logout to the end_session endpoint only ends the one session tied to its
+	#    id_token (which we don't have here) — and a portal login spawns several sessions, so the
+	#    SSO session would survive and the back-channel fan-out would never fire. Killing all of
+	#    the user's sessions makes Keycloak back-channel-logout every registered client (the
+	#    central portal and all other apps) in one shot. Isolated so a failure here can never
+	#    undo the redirect set above.
+	try:
 		if user:
 			_terminate_all_keycloak_sessions(user)
-
-		portal_url = (frappe.conf.get("kc_central_portal_url") or "").rstrip("/")
-		post_logout_redirect_uri = (
-			f"{portal_url}/kalyan/applications?no_access=1"
-			if portal_url
-			else frappe.utils.get_url("/login")
-		)
-
-		# Sessions are already gone server-side, so land the browser straight on the central
-		# portal's public no-access page. No dependency on the Keycloak end_session endpoint
-		# (which without an id_token_hint would not reliably end the session anyway).
-		frappe.local.response["redirect_to"] = post_logout_redirect_uri
 	except Exception as exc:
-		frappe.logger().error(f"KC_LOGOUT: on_logout failed: {exc}")
+		frappe.logger().error(f"KC_LOGOUT: session termination failed: {exc}")
 
 
 def _terminate_all_keycloak_sessions(user: str) -> bool:
