@@ -28,11 +28,6 @@ def sync_on_user_creation(doc, method=None):
 
 
 def sync_on_session_creation():
-	"""
-	Fires on every new Frappe session.  Rate-limited with a 10-minute Redis
-	cache so we don't hammer Keycloak on every page refresh.  Useful for
-	picking up role changes in Keycloak after the user already exists.
-	"""
 	user = frappe.session.user
 	if not user or user in ("Guest", "Administrator"):
 		return
@@ -41,7 +36,13 @@ def sync_on_session_creation():
 	if frappe.cache().get_value(cache_key):
 		return
 
-	_do_sync(user)
+	frappe.enqueue(
+		"kc_role_sync.role_sync._do_sync",
+		email=user,
+		queue="short",
+		timeout=300,
+		enqueue_after_commit=True,
+	)
 	frappe.cache().set_value(cache_key, 1, expires_in_sec=600)
 
 
@@ -111,7 +112,7 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 			f"{base_url}/admin/realms/{realm}/users",
 			params={"email": email, "exact": "true"},
 			headers={"Authorization": f"Bearer {token}"},
-			timeout=10,
+			timeout=(3, 5),
 			proxies=NO_PROXY,
 		)
 		users = resp.json() if resp.status_code == 200 else []
@@ -130,7 +131,7 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 		resp = requests.get(
 			f"{base_url}/admin/realms/{realm}/users/{kc_user_id}/role-mappings",
 			headers={"Authorization": f"Bearer {token}"},
-			timeout=10,
+			timeout=(3, 5),
 			proxies=NO_PROXY,
 		)
 		mappings = resp.json() if resp.status_code == 200 else {}
@@ -165,7 +166,7 @@ def _get_admin_token(base_url: str, realm: str, client_id: str, client_secret: s
 				"client_id": client_id,
 				"client_secret": client_secret,
 			},
-			timeout=10,
+			timeout=(3, 5),
 			proxies=NO_PROXY,
 		)
 		return resp.json().get("access_token")
@@ -186,3 +187,56 @@ def _extract_realm(api_endpoint: str) -> str | None:
 
 def _is_internal(role_name: str) -> bool:
 	return role_name in _INTERNAL_ROLES or role_name.startswith("default-roles-")
+
+
+# ── Frappe → Keycloak: report this site's own roles ─────────────────────────
+
+# Common Frappe framework roles present on every site regardless of which
+# business app is installed — never meaningful as a Keycloak client role, so
+# never reported. Deliberately short: business/app roles (Sales Manager, HR
+# Manager, a custom app's own roles, ...) should sync by default.
+_TECHNICAL_ROLES = frozenset([
+	"Guest",
+	"All",
+	"Administrator",
+	"Desk User",
+])
+
+
+@frappe.whitelist(allow_guest=True)
+def get_client_roles() -> dict:
+	"""
+	Reports this site's own Role list — the reverse direction of
+	sync_on_user_creation/sync_on_session_creation above, which assign
+	Keycloak roles TO a user. This is what the portal's "Sync Roles from App"
+	pulls so an admin doesn't have to hand-type every role into Keycloak.
+
+	Skips disabled roles and the common Frappe framework roles in
+	_TECHNICAL_ROLES; everything else — including ERPNext and any custom
+	app's roles — is reported.
+
+	Auth: same X-KJI-Secret / kji_push_secret contract as
+	module_sync.get_module_structure (set via the site's KJI Portal
+	Application.push_secret / `bench set-config kji_push_secret <value>`).
+	"""
+	_require_secret()
+
+	rows = frappe.get_all(
+		"Role",
+		filters={"disabled": 0, "name": ["not in", list(_TECHNICAL_ROLES)]},
+		fields=["name"],
+		order_by="name asc",
+	)
+	roles = [{"role_name": r["name"], "role_code": r["name"]} for r in rows]
+	return {"status": "success", "roles": roles}
+
+
+def _require_secret() -> None:
+	expected = (frappe.conf.get("kji_push_secret") or "").strip()
+	if not expected:
+		frappe.logger().error("KC_ROLE_SYNC: kji_push_secret not configured — rejecting")
+		frappe.throw("Role sync is not configured on this site.", frappe.AuthenticationError)
+
+	provided = frappe.get_request_header("X-KJI-Secret") or ""
+	if provided != expected:
+		frappe.throw("Invalid secret.", frappe.AuthenticationError)
