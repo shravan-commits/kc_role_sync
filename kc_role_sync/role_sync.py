@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import frappe
 import requests
 from frappe.utils.password import get_decrypted_password
@@ -190,17 +192,10 @@ def _is_internal(role_name: str) -> bool:
 
 
 # ── Frappe → Keycloak: report this site's own roles ─────────────────────────
-
-# Common Frappe framework roles present on every site regardless of which
-# business app is installed — never meaningful as a Keycloak client role, so
-# never reported. Deliberately short: business/app roles (Sales Manager, HR
-# Manager, a custom app's own roles, ...) should sync by default.
-_TECHNICAL_ROLES = frozenset([
-	"Guest",
-	"All",
-	"Administrator",
-	"Desk User",
-])
+#
+# The technical-role exclusion list and the opt-in checkbox tracking both live
+# in kc_role_sync_settings.py now (single source of truth for "which roles are
+# eligible at all").
 
 
 @frappe.whitelist(allow_guest=True)
@@ -211,9 +206,12 @@ def get_client_roles() -> dict:
 	Keycloak roles TO a user. This is what the portal's "Sync Roles from App"
 	pulls so an admin doesn't have to hand-type every role into Keycloak.
 
-	Skips disabled roles and the common Frappe framework roles in
-	_TECHNICAL_ROLES; everything else — including ERPNext and any custom
-	app's roles — is reported.
+	Skips disabled roles and the common Frappe framework roles (see
+	kc_role_sync_settings._TECHNICAL_ROLES), and only reports roles this
+	site's admin has opted in
+	via the "KC Role Sync Settings" checkbox page (kc_role_sync_settings.py).
+	New roles default checked, so a client who never opens that page keeps
+	today's "sync everything" behaviour.
 
 	Auth: same X-KJI-Secret / kji_push_secret contract as
 	module_sync.get_module_structure (set via the site's KJI Portal
@@ -221,14 +219,64 @@ def get_client_roles() -> dict:
 	"""
 	_require_secret()
 
-	rows = frappe.get_all(
-		"Role",
-		filters={"disabled": 0, "name": ["not in", list(_TECHNICAL_ROLES)]},
-		fields=["name"],
-		order_by="name asc",
+	from kc_role_sync.kc_role_sync.doctype.kc_role_sync_settings.kc_role_sync_settings import (
+		get_enabled_roles,
 	)
-	roles = [{"role_name": r["name"], "role_code": r["name"]} for r in rows]
+
+	enabled = get_enabled_roles()
+	roles = [{"role_name": name, "role_code": name} for name in sorted(enabled)]
 	return {"status": "success", "roles": roles}
+
+
+@frappe.whitelist(allow_guest=True)
+def push_user_roles(email: str, role_names=None) -> dict:
+	"""
+	Portal pushes a user's desired Role set for THIS app right when an admin approves a
+	role add/remove — instead of relying on sync_on_session_creation, which only fires on
+	the user's next login and is additive-only (it never removes a role, see _do_sync
+	above). This is what actually makes a removal in the portal take effect here without
+	waiting for the user to log back in.
+
+	Reconciles both directions (adds missing roles, removes ones no longer desired), but
+	ONLY within the roles this site tracks via "KC Role Sync Settings" — the same catalog
+	get_client_roles reports from. Anything outside that tracked set (System Manager, a
+	role never opted into sync, ...) is never touched, so this can't strip access that
+	didn't come from the portal in the first place.
+
+	Auth: same X-KJI-Secret / kji_push_secret contract as get_client_roles.
+	"""
+	_require_secret()
+
+	if not frappe.db.exists("User", email):
+		return {"status": "success", "applied": False, "reason": "user_not_found"}
+
+	if isinstance(role_names, str):
+		role_names = json.loads(role_names) if role_names else []
+	desired = {r for r in (role_names or []) if r and frappe.db.exists("Role", r)}
+
+	settings = frappe.get_single("KC Role Sync Settings")
+	tracked_roles = {row.role for row in settings.roles}
+
+	user = frappe.get_doc("User", email)
+	existing = {r.role for r in user.get("roles", [])}
+
+	to_add = desired - existing
+	to_remove = (existing & tracked_roles) - desired
+
+	if not to_add and not to_remove:
+		return {"status": "success", "applied": False, "added": [], "removed": []}
+
+	for role in sorted(to_add):
+		user.append("roles", {"role": role})
+	if to_remove:
+		user.set("roles", [row for row in user.get("roles", []) if row.role not in to_remove])
+
+	user.save(ignore_permissions=True)
+	frappe.db.commit()
+	frappe.logger().info(
+		f"KC_ROLE_SYNC: Pushed roles for {email} — added {sorted(to_add)}, removed {sorted(to_remove)}"
+	)
+	return {"status": "success", "applied": True, "added": sorted(to_add), "removed": sorted(to_remove)}
 
 
 def _require_secret() -> None:
