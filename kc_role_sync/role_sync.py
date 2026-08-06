@@ -6,8 +6,6 @@ import frappe
 import requests
 from frappe.utils.password import get_decrypted_password
 
-NO_PROXY = {"http": "", "https": ""}
-
 # Keycloak built-in roles that should never be assigned as Frappe roles
 _INTERNAL_ROLES = frozenset([
 	"offline_access",
@@ -115,7 +113,6 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 			params={"email": email, "exact": "true"},
 			headers={"Authorization": f"Bearer {token}"},
 			timeout=(3, 5),
-			proxies=NO_PROXY,
 		)
 		users = resp.json() if resp.status_code == 200 else []
 		if not users:
@@ -134,7 +131,6 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 			f"{base_url}/admin/realms/{realm}/users/{kc_user_id}/role-mappings",
 			headers={"Authorization": f"Bearer {token}"},
 			timeout=(3, 5),
-			proxies=NO_PROXY,
 		)
 		mappings = resp.json() if resp.status_code == 200 else {}
 
@@ -169,7 +165,6 @@ def _get_admin_token(base_url: str, realm: str, client_id: str, client_secret: s
 				"client_secret": client_secret,
 			},
 			timeout=(3, 5),
-			proxies=NO_PROXY,
 		)
 		return resp.json().get("access_token")
 	except Exception as exc:
