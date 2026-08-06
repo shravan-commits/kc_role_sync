@@ -1,10 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import frappe
 import requests
 from frappe.utils.password import get_decrypted_password
+
+# Dedicated log file (logs/kc_role_sync.log, bench and site level) instead of
+# the shared frappe.log — makes this app's activity easy to tail/grep on its
+# own. Also explicitly set to INFO: Frappe's default production log level is
+# ERROR, which would otherwise silently drop every info/warning line below,
+# leaving only bare error messages with no context on what led to them.
+_logger = frappe.logger("kc_role_sync", allow_site=True, file_count=20)
+_logger.setLevel(logging.INFO)
 
 # Some deployments sit behind a WAF that silently rejects the default
 # python-requests User-Agent (empty/non-JSON body, no clear error) before the
@@ -60,10 +69,11 @@ def sync_on_session_creation():
 # ── core sync ────────────────────────────────────────────────────────────────
 
 def _do_sync(email: str) -> None:
+	_logger.info(f"KC_ROLE_SYNC: _do_sync starting for {email}")
 	try:
 		clients = _get_keycloak_clients()
 		if not clients:
-			frappe.logger().info(f"KC_ROLE_SYNC: No Social Login Keys found for site — skipping {email}")
+			_logger.info(f"KC_ROLE_SYNC: No Social Login Keys found for site — skipping {email}")
 			return
 
 		frappe_user = frappe.get_doc("User", email)
@@ -77,18 +87,18 @@ def _do_sync(email: str) -> None:
 		for role in set(new_roles):
 			if frappe.db.exists("Role", role) and role not in existing_roles:
 				frappe_user.append("roles", {"role": role})
-				frappe.logger().info(f"KC_ROLE_SYNC: Assigning role '{role}' to {email}")
+				_logger.info(f"KC_ROLE_SYNC: Assigning role '{role}' to {email}")
 				added = True
 
 		if added:
 			frappe_user.save(ignore_permissions=True)
 			frappe.db.commit()
-			frappe.logger().info(f"KC_ROLE_SYNC: Roles saved for {email}")
+			_logger.info(f"KC_ROLE_SYNC: Roles saved for {email}")
 		else:
-			frappe.logger().info(f"KC_ROLE_SYNC: No new roles to assign for {email}")
+			_logger.info(f"KC_ROLE_SYNC: No new roles to assign for {email}")
 
 	except Exception as exc:
-		frappe.logger().error(f"KC_ROLE_SYNC: Error syncing roles for {email}: {exc}")
+		_logger.error(f"KC_ROLE_SYNC: Error syncing roles for {email}: {exc}")
 
 
 # ── Keycloak helpers ─────────────────────────────────────────────────────────
@@ -110,12 +120,12 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 
 		realm = _extract_realm(api_endpoint)
 		if not realm:
-			frappe.logger().warning(f"KC_ROLE_SYNC: Cannot extract realm from api_endpoint '{api_endpoint}'")
+			_logger.warning(f"KC_ROLE_SYNC: Cannot extract realm from api_endpoint '{api_endpoint}'")
 			return []
 
 		token = _get_admin_token(base_url, realm, client_id, client_secret)
 		if not token:
-			frappe.logger().warning(f"KC_ROLE_SYNC: Could not get admin token for realm '{realm}'")
+			_logger.warning(f"KC_ROLE_SYNC: Could not get admin token for realm '{realm}'")
 			return []
 
 		# Locate user in Keycloak by email
@@ -127,7 +137,7 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 		)
 		users = resp.json() if resp.status_code == 200 else []
 		if not users:
-			frappe.logger().info(f"KC_ROLE_SYNC: User {email} not found in Keycloak realm '{realm}'")
+			_logger.info(f"KC_ROLE_SYNC: User {email} not found in Keycloak realm '{realm}'")
 			return []
 
 		kc_user_id = users[0]["id"]
@@ -158,15 +168,16 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 			for r in client_mappings[client_id].get("mappings", []):
 				roles.append(r["name"])
 
-		frappe.logger().info(f"KC_ROLE_SYNC: Found Keycloak roles for {email}: {roles}")
+		_logger.info(f"KC_ROLE_SYNC: Found Keycloak roles for {email}: {roles}")
 		return roles
 
 	except Exception as exc:
-		frappe.logger().error(f"KC_ROLE_SYNC: _get_keycloak_roles failed for {email}: {exc}")
+		_logger.error(f"KC_ROLE_SYNC: _get_keycloak_roles failed for {email}: {exc}")
 		return []
 
 
 def _get_admin_token(base_url: str, realm: str, client_id: str, client_secret: str) -> str | None:
+	resp = None
 	try:
 		resp = requests.post(
 			f"{base_url}/realms/{realm}/protocol/openid-connect/token",
@@ -178,9 +189,21 @@ def _get_admin_token(base_url: str, realm: str, client_id: str, client_secret: s
 			headers=_BROWSER_HEADERS,
 			timeout=(3, 5),
 		)
-		return resp.json().get("access_token")
+		token = resp.json().get("access_token")
+		if not token:
+			_logger.warning(
+				f"KC_ROLE_SYNC: Admin token response had no access_token "
+				f"(status={resp.status_code}, body={resp.text[:300]!r})"
+			)
+		return token
 	except Exception as exc:
-		frappe.logger().error(f"KC_ROLE_SYNC: Admin token request failed: {exc}")
+		if resp is not None:
+			_logger.error(
+				f"KC_ROLE_SYNC: Admin token request failed: {exc} "
+				f"(status={resp.status_code}, body={resp.text[:300]!r})"
+			)
+		else:
+			_logger.error(f"KC_ROLE_SYNC: Admin token request failed before any response: {exc}")
 		return None
 
 
@@ -280,7 +303,7 @@ def push_user_roles(email: str, role_names=None) -> dict:
 
 	user.save(ignore_permissions=True)
 	frappe.db.commit()
-	frappe.logger().info(
+	_logger.info(
 		f"KC_ROLE_SYNC: Pushed roles for {email} — added {sorted(to_add)}, removed {sorted(to_remove)}"
 	)
 	return {"status": "success", "applied": True, "added": sorted(to_add), "removed": sorted(to_remove)}
@@ -289,7 +312,7 @@ def push_user_roles(email: str, role_names=None) -> dict:
 def _require_secret() -> None:
 	expected = (frappe.conf.get("kji_push_secret") or "").strip()
 	if not expected:
-		frappe.logger().error("KC_ROLE_SYNC: kji_push_secret not configured — rejecting")
+		_logger.error("KC_ROLE_SYNC: kji_push_secret not configured — rejecting")
 		frappe.throw("Role sync is not configured on this site.", frappe.AuthenticationError)
 
 	provided = frappe.get_request_header("X-KJI-Secret") or ""
