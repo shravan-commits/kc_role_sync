@@ -318,3 +318,34 @@ def _require_secret() -> None:
 	provided = frappe.get_request_header("X-KJI-Secret") or ""
 	if provided != expected:
 		frappe.throw("Invalid secret.", frappe.AuthenticationError)
+
+
+@frappe.whitelist(allow_guest=True)
+def get_recent_logs(lines: int = 200) -> dict:
+	"""
+	Remote-readable tail of this site's own kc_role_sync.log — lets the
+	central portal pull diagnostic output directly over HTTPS instead of
+	needing someone with server access to manually copy/paste it every time.
+
+	Auth: same X-KJI-Secret / kji_push_secret contract as get_client_roles.
+	"""
+	_require_secret()
+
+	import os
+
+	try:
+		n = max(1, min(int(lines), 2000))
+	except (TypeError, ValueError):
+		n = 200
+
+	site_log = frappe.utils.get_site_path("logs", "kc_role_sync.log")
+	bench_log = os.path.join(frappe.utils.get_bench_path(), "logs", "kc_role_sync.log")
+	log_path = site_log if os.path.exists(site_log) else (bench_log if os.path.exists(bench_log) else None)
+
+	if not log_path:
+		return {"status": "not_found", "checked": [site_log, bench_log]}
+
+	with open(log_path, encoding="utf-8", errors="replace") as f:
+		content = f.readlines()
+
+	return {"status": "success", "path": log_path, "lines": content[-n:]}
