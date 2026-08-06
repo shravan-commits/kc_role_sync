@@ -133,7 +133,7 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 			f"{base_url}/admin/realms/{realm}/users",
 			params={"email": email, "exact": "true"},
 			headers={**_BROWSER_HEADERS, "Authorization": f"Bearer {token}"},
-			timeout=(3, 5),
+			timeout=(5, 15),
 		)
 		users = resp.json() if resp.status_code == 200 else []
 		if not users:
@@ -151,7 +151,7 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 		resp = requests.get(
 			f"{base_url}/admin/realms/{realm}/users/{kc_user_id}/role-mappings",
 			headers={**_BROWSER_HEADERS, "Authorization": f"Bearer {token}"},
-			timeout=(3, 5),
+			timeout=(5, 15),
 		)
 		mappings = resp.json() if resp.status_code == 200 else {}
 
@@ -187,7 +187,7 @@ def _get_admin_token(base_url: str, realm: str, client_id: str, client_secret: s
 				"client_secret": client_secret,
 			},
 			headers=_BROWSER_HEADERS,
-			timeout=(3, 5),
+			timeout=(5, 15),
 		)
 		token = resp.json().get("access_token")
 		if not token:
