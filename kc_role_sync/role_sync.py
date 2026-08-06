@@ -6,6 +6,17 @@ import frappe
 import requests
 from frappe.utils.password import get_decrypted_password
 
+# Some deployments sit behind a WAF that silently rejects the default
+# python-requests User-Agent (empty/non-JSON body, no clear error) before the
+# request ever reaches Keycloak — a browser-like UA avoids that.
+_BROWSER_HEADERS = {
+	"User-Agent": (
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+		"(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+	),
+	"Accept": "application/json, text/plain, */*",
+}
+
 # Keycloak built-in roles that should never be assigned as Frappe roles
 _INTERNAL_ROLES = frozenset([
 	"offline_access",
@@ -111,7 +122,7 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 		resp = requests.get(
 			f"{base_url}/admin/realms/{realm}/users",
 			params={"email": email, "exact": "true"},
-			headers={"Authorization": f"Bearer {token}"},
+			headers={**_BROWSER_HEADERS, "Authorization": f"Bearer {token}"},
 			timeout=(3, 5),
 		)
 		users = resp.json() if resp.status_code == 200 else []
@@ -129,7 +140,7 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 		# Fetch all role mappings (realm + client-specific)
 		resp = requests.get(
 			f"{base_url}/admin/realms/{realm}/users/{kc_user_id}/role-mappings",
-			headers={"Authorization": f"Bearer {token}"},
+			headers={**_BROWSER_HEADERS, "Authorization": f"Bearer {token}"},
 			timeout=(3, 5),
 		)
 		mappings = resp.json() if resp.status_code == 200 else {}
@@ -164,6 +175,7 @@ def _get_admin_token(base_url: str, realm: str, client_id: str, client_secret: s
 				"client_id": client_id,
 				"client_secret": client_secret,
 			},
+			headers=_BROWSER_HEADERS,
 			timeout=(3, 5),
 		)
 		return resp.json().get("access_token")
