@@ -40,9 +40,20 @@ _INTERNAL_ROLES = frozenset([
 def sync_on_user_creation(doc, method=None):
 	"""
 	User.after_insert — fires the first time a user logs in via Keycloak SSO
-	and Frappe creates their account. Assigns Keycloak roles immediately.
+	and Frappe creates their account. Assigns Keycloak roles in the
+	background: the Admin API call this depends on has been observed to take
+	80+ seconds on this network (proxy latency, not a hard failure), far too
+	long to block the user's actual login response on — so this is enqueued
+	the same way sync_on_session_creation already handles it, instead of
+	calling _do_sync inline.
 	"""
-	_do_sync(doc.name)
+	frappe.enqueue(
+		"kc_role_sync.role_sync._do_sync",
+		email=doc.name,
+		queue="short",
+		timeout=300,
+		enqueue_after_commit=True,
+	)
 	# Stamp cache so on_session_creation skips the duplicate call right after
 	frappe.cache().set_value(f"kc_role_sync:{doc.name}", 1, expires_in_sec=600)
 
@@ -133,7 +144,7 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 			f"{base_url}/admin/realms/{realm}/users",
 			params={"email": email, "exact": "true"},
 			headers={**_BROWSER_HEADERS, "Authorization": f"Bearer {token}"},
-			timeout=(5, 15),
+			timeout=(10, 40),
 		)
 		users = resp.json() if resp.status_code == 200 else []
 		if not users:
@@ -151,7 +162,7 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 		resp = requests.get(
 			f"{base_url}/admin/realms/{realm}/users/{kc_user_id}/role-mappings",
 			headers={**_BROWSER_HEADERS, "Authorization": f"Bearer {token}"},
-			timeout=(5, 15),
+			timeout=(10, 40),
 		)
 		mappings = resp.json() if resp.status_code == 200 else {}
 
@@ -177,34 +188,43 @@ def _get_keycloak_roles(client: dict, email: str) -> list[str]:
 
 
 def _get_admin_token(base_url: str, realm: str, client_id: str, client_secret: str) -> str | None:
-	resp = None
-	try:
-		resp = requests.post(
-			f"{base_url}/realms/{realm}/protocol/openid-connect/token",
-			data={
-				"grant_type": "client_credentials",
-				"client_id": client_id,
-				"client_secret": client_secret,
-			},
-			headers=_BROWSER_HEADERS,
-			timeout=(5, 15),
-		)
-		token = resp.json().get("access_token")
-		if not token:
-			_logger.warning(
-				f"KC_ROLE_SYNC: Admin token response had no access_token "
-				f"(status={resp.status_code}, body={resp.text[:300]!r})"
+	# Observed: this specific call (client_credentials grant, through this
+	# deployment's proxy) can take 80+ seconds to complete even when it does
+	# succeed — genuinely slow/intermittently flaky, not a hard failure. A
+	# couple of bounded retries handles that far better than one long wait,
+	# and since the caller now runs this in a background job (see
+	# sync_on_user_creation), the extra time has no user-facing cost.
+	for attempt in range(1, 3):
+		resp = None
+		try:
+			resp = requests.post(
+				f"{base_url}/realms/{realm}/protocol/openid-connect/token",
+				data={
+					"grant_type": "client_credentials",
+					"client_id": client_id,
+					"client_secret": client_secret,
+				},
+				headers=_BROWSER_HEADERS,
+				timeout=(10, 40),
 			)
-		return token
-	except Exception as exc:
-		if resp is not None:
-			_logger.error(
-				f"KC_ROLE_SYNC: Admin token request failed: {exc} "
-				f"(status={resp.status_code}, body={resp.text[:300]!r})"
-			)
-		else:
-			_logger.error(f"KC_ROLE_SYNC: Admin token request failed before any response: {exc}")
-		return None
+			token = resp.json().get("access_token")
+			if not token:
+				_logger.warning(
+					f"KC_ROLE_SYNC: Admin token response had no access_token "
+					f"(attempt={attempt}, status={resp.status_code}, body={resp.text[:300]!r})"
+				)
+			return token
+		except Exception as exc:
+			if resp is not None:
+				log = f"KC_ROLE_SYNC: Admin token attempt {attempt} failed: {exc} (status={resp.status_code}, body={resp.text[:300]!r})"
+			else:
+				log = f"KC_ROLE_SYNC: Admin token attempt {attempt} failed before any response: {exc}"
+			if attempt < 2:
+				_logger.warning(log)
+			else:
+				_logger.error(log)
+
+	return None
 
 
 def _extract_realm(api_endpoint: str) -> str | None:
