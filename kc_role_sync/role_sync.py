@@ -77,7 +77,116 @@ def sync_on_session_creation():
 	frappe.cache().set_value(cache_key, 1, expires_in_sec=600)
 
 
+# ── fast path: roles straight from the login token ──────────────────────────
+
+@frappe.whitelist(allow_guest=True)
+def login_via_keycloak_fast(code: str, state: str):
+	"""
+	Overrides frappe.integrations.oauth2_logins.login_via_keycloak (wired up
+	via override_whitelisted_methods in hooks.py) so Keycloak roles are
+	assigned on the spot at login, instead of only via the separate,
+	slow/flaky Admin API round-trip in _do_sync.
+
+	Does the exact same OAuth exchange Frappe core's own login_via_keycloak
+	does — reusing core's own get_oauth2_flow/get_redirect_uri/
+	login_oauth_user helpers directly, so state validation, user creation,
+	and session login behave identically to core's implementation. The only
+	addition: core computes the raw access token during this exchange and
+	then discards it after fetching userinfo — here it's kept and decoded
+	for this client's `resource_access` roles (same claim the central
+	portal's own establish_session reads), applied via the same
+	_apply_roles() the slow path uses.
+
+	sync_on_session_creation still fires on every login as a fallback
+	(rate-limited to once per 10 minutes via the shared cache key below),
+	in case a role changed in Keycloak after this token was minted, or this
+	fast path fails for any reason.
+	"""
+	from frappe.utils.oauth import get_email, get_oauth2_flow, get_oauth2_providers, get_redirect_uri, login_oauth_user
+
+	provider = "keycloak"
+
+	try:
+		flow = get_oauth2_flow(provider)
+		session = flow.get_auth_session(
+			data={
+				"code": code,
+				"redirect_uri": get_redirect_uri(provider),
+				"grant_type": "authorization_code",
+			},
+			decoder=lambda b: json.loads(bytes(b).decode("utf-8")),
+		)
+	except Exception as exc:
+		# Don't leave the user stuck if our own exchange attempt fails for
+		# any reason — fall back to core's real implementation.
+		_logger.error(f"KC_ROLE_SYNC: fast-path token exchange failed, falling back to core: {exc}")
+		import frappe.integrations.oauth2_logins as _core_oauth2_logins
+		return _core_oauth2_logins.login_via_keycloak(code, state)
+
+	access_token = getattr(session, "access_token", None)
+
+	oauth2_providers = get_oauth2_providers()
+	api_endpoint = oauth2_providers[provider].get("api_endpoint")
+	api_endpoint_args = oauth2_providers[provider].get("api_endpoint_args")
+	info = session.get(api_endpoint, params=api_endpoint_args).json()
+
+	if not (info.get("email_verified") or get_email(info)):
+		frappe.throw(f"Email not verified with {provider.title()}")
+
+	candidate_roles: list[str] = []
+	if access_token:
+		try:
+			import jwt as pyjwt
+			claims = pyjwt.decode(access_token, options={"verify_signature": False})
+			resource_access = claims.get("resource_access", {})
+			candidate_roles = resource_access.get(flow.client_id, {}).get("roles", [])
+		except Exception as exc:
+			_logger.warning(f"KC_ROLE_SYNC: fast-path JWT decode failed: {exc}")
+
+	# Does state validation, user find-or-create, and session login exactly
+	# like core's own login_via_keycloak — this is core's real function,
+	# just called directly instead of via the whitelisted wrapper.
+	login_oauth_user(info, provider=provider, state=state)
+
+	user = frappe.session.user
+	if user and user != "Guest":
+		if candidate_roles:
+			added = _apply_roles(user, candidate_roles)
+			if added:
+				_logger.info(f"KC_ROLE_SYNC: fast-path assigned roles for {user}: {added}")
+			else:
+				_logger.info(f"KC_ROLE_SYNC: fast-path found no new roles to assign for {user}")
+		else:
+			_logger.info(f"KC_ROLE_SYNC: fast-path got no resource_access roles for {user}")
+		# Same dedupe key sync_on_user_creation/sync_on_session_creation use,
+		# so the fallback background sync doesn't immediately redo this.
+		frappe.cache().set_value(f"kc_role_sync:{user}", 1, expires_in_sec=600)
+
+
 # ── core sync ────────────────────────────────────────────────────────────────
+
+def _apply_roles(email: str, candidate_roles: list[str]) -> list[str]:
+	"""
+	Assigns whichever of candidate_roles exist as Frappe Roles and aren't
+	already on the user. Shared by both the slow Admin-API path (_do_sync)
+	and the fast JWT-decode path (login_via_keycloak_fast) so role
+	application logic only lives in one place.
+	"""
+	frappe_user = frappe.get_doc("User", email)
+	existing_roles = {r.role for r in frappe_user.get("roles", [])}
+
+	added: list[str] = []
+	for role in set(candidate_roles):
+		if not _is_internal(role) and frappe.db.exists("Role", role) and role not in existing_roles:
+			frappe_user.append("roles", {"role": role})
+			added.append(role)
+
+	if added:
+		frappe_user.save(ignore_permissions=True)
+		frappe.db.commit()
+
+	return added
+
 
 def _do_sync(email: str) -> None:
 	_logger.info(f"KC_ROLE_SYNC: _do_sync starting for {email}")
@@ -87,24 +196,13 @@ def _do_sync(email: str) -> None:
 			_logger.info(f"KC_ROLE_SYNC: No Social Login Keys found for site — skipping {email}")
 			return
 
-		frappe_user = frappe.get_doc("User", email)
-		existing_roles = {r.role for r in frappe_user.get("roles", [])}
-
 		new_roles: list[str] = []
 		for client in clients:
 			new_roles.extend(_get_keycloak_roles(client, email))
 
-		added = False
-		for role in set(new_roles):
-			if frappe.db.exists("Role", role) and role not in existing_roles:
-				frappe_user.append("roles", {"role": role})
-				_logger.info(f"KC_ROLE_SYNC: Assigning role '{role}' to {email}")
-				added = True
-
+		added = _apply_roles(email, new_roles)
 		if added:
-			frappe_user.save(ignore_permissions=True)
-			frappe.db.commit()
-			_logger.info(f"KC_ROLE_SYNC: Roles saved for {email}")
+			_logger.info(f"KC_ROLE_SYNC: Roles saved for {email}: {added}")
 		else:
 			_logger.info(f"KC_ROLE_SYNC: No new roles to assign for {email}")
 
