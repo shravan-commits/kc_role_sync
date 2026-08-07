@@ -150,17 +150,25 @@ def login_via_keycloak_fast(code: str, state: str):
 
 	user = frappe.session.user
 	if user and user != "Guest":
-		if candidate_roles:
-			added = _apply_roles(user, candidate_roles)
-			if added:
-				_logger.info(f"KC_ROLE_SYNC: fast-path assigned roles for {user}: {added}")
+		# Login has already succeeded at this point (session established) —
+		# a failure in role assignment must not turn into a broken response
+		# for what is otherwise a successful login.
+		try:
+			if candidate_roles:
+				added = _apply_roles(user, candidate_roles)
+				if added:
+					_logger.info(f"KC_ROLE_SYNC: fast-path assigned roles for {user}: {added}")
+				else:
+					_logger.info(f"KC_ROLE_SYNC: fast-path found no new roles to assign for {user}")
 			else:
-				_logger.info(f"KC_ROLE_SYNC: fast-path found no new roles to assign for {user}")
-		else:
-			_logger.info(f"KC_ROLE_SYNC: fast-path got no resource_access roles for {user}")
-		# Same dedupe key sync_on_user_creation/sync_on_session_creation use,
-		# so the fallback background sync doesn't immediately redo this.
-		frappe.cache().set_value(f"kc_role_sync:{user}", 1, expires_in_sec=600)
+				_logger.info(f"KC_ROLE_SYNC: fast-path got no resource_access roles for {user}")
+			# Same dedupe key sync_on_user_creation/sync_on_session_creation
+			# use, so the fallback background sync doesn't immediately redo
+			# this — only stamped on success, so a failure here still lets
+			# the background fallback have a go.
+			frappe.cache().set_value(f"kc_role_sync:{user}", 1, expires_in_sec=600)
+		except Exception as exc:
+			_logger.error(f"KC_ROLE_SYNC: fast-path role assignment failed for {user}: {exc}")
 
 
 # ── core sync ────────────────────────────────────────────────────────────────
