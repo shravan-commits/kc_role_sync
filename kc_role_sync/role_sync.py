@@ -154,6 +154,7 @@ def login_via_keycloak_fast(code: str, state: str):
 		# a failure in role assignment must not turn into a broken response
 		# for what is otherwise a successful login.
 		try:
+			added: list[str] = []
 			if candidate_roles:
 				added = _apply_roles(user, candidate_roles)
 				if added:
@@ -167,6 +168,19 @@ def login_via_keycloak_fast(code: str, state: str):
 			# this — only stamped on success, so a failure here still lets
 			# the background fallback have a go.
 			frappe.cache().set_value(f"kc_role_sync:{user}", 1, expires_in_sec=600)
+
+			if added:
+				# login_oauth_user() (above) already decided and set the
+				# post-login redirect via redirect_post_login(), but it did
+				# so BEFORE these roles existed — for a brand-new user that
+				# means it saw someone with no roles yet and sent them to
+				# the website/home page instead of the desk. Redo that
+				# decision now that the user's roles are actually current,
+				# so a first-ever login lands in the same place a second
+				# login would (instead of needing a second attempt).
+				from frappe.utils.oauth import redirect_post_login
+				desk_user = frappe.db.get_value("User", user, "user_type") == "System User"
+				redirect_post_login(desk_user=desk_user, provider=provider)
 		except Exception as exc:
 			_logger.error(f"KC_ROLE_SYNC: fast-path role assignment failed for {user}: {exc}")
 
